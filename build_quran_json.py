@@ -14,6 +14,7 @@ Output:
   docs/index.json              daftar 114 surah (+ start_page jika --meta ada)
   docs/surah/{n}.json          satu surah lengkap (Arab + terjemahan)
   docs/page/{n}.json           satu halaman Mushaf Madinah, 604 halaman (butuh --meta)
+  docs/juz.json                halaman awal tiap juz, 30 angka (butuh --meta)
   docs/ayat/{n}/{a}.json       satu ayat (lewati dengan --skip-ayat)
   docs/meta.json               sumber, jumlah, dan checksum SHA-256 file input
 """
@@ -218,6 +219,10 @@ def main() -> None:
                 page_obj["juz"] = bisect.bisect_right(juz_pos, start)
             page_obj["ayat"] = [ayah_obj(s, a) for s, a in ALL_KEYS[start:end]]
             write_json(args.out / "page" / f"{i + 1}.json", page_obj)
+
+        if juz_pos:
+            # Halaman awal tiap juz (30 angka), untuk fitur lompat ke juz.
+            write_json(args.out / "juz.json", [bisect.bisect_right(page_pos, jp) for jp in juz_pos])
 
     write_json(args.out / "index.json", index)
     meta_obj = {
