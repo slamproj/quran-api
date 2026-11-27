@@ -8,20 +8,24 @@ Pemakaian:
       --arabic quran-uthmani.txt \
       --translation id.indonesian.txt \
       --meta quran-data.xml \
-      --out dist
+      --out docs
 
 Output:
-  dist/index.json              daftar 114 surah
-  dist/surah/{n}.json          satu surah lengkap (Arab + terjemahan)
-  dist/ayat/{n}/{a}.json       satu ayat (lewati dengan --skip-ayat)
-  dist/meta.json               sumber, jumlah, dan checksum SHA-256 file input
+  docs/index.json              daftar 114 surah (+ start_page jika --meta ada)
+  docs/surah/{n}.json          satu surah lengkap (Arab + terjemahan)
+  docs/page/{n}.json           satu halaman Mushaf Madinah, 604 halaman (butuh --meta)
+  docs/ayat/{n}/{a}.json       satu ayat (lewati dengan --skip-ayat)
+  docs/meta.json               sumber, jumlah, dan checksum SHA-256 file input
 """
 import argparse
+import bisect
 import hashlib
 import json
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+TOTAL_PAGES = 604
 
 # Jumlah ayat resmi per surah (total 6.236). Dipakai untuk validasi.
 AYAH_COUNTS = [
@@ -38,6 +42,9 @@ AYAH_COUNTS = [
     11, 8, 3, 9, 5, 4, 7, 3, 6, 3,
     5, 4, 5, 6,
 ]
+
+ALL_KEYS = [(s, a) for s, c in enumerate(AYAH_COUNTS, start=1) for a in range(1, c + 1)]
+POS = {k: i for i, k in enumerate(ALL_KEYS)}
 
 
 def sha256(path: Path) -> str:
@@ -81,6 +88,23 @@ def parse_meta(path: Path) -> dict:
     return meta
 
 
+def parse_partitions(path: Path):
+    """Baca titik awal halaman dan juz dari quran-data.xml.
+    Mengembalikan (pages, juzs): masing-masing list [(surah, ayat), ...]."""
+    root = ET.parse(path).getroot()
+
+    def collect(tag):
+        items = []
+        for el in root.iter(tag):
+            idx, s, a = el.get("index"), el.get("sura"), el.get("aya")
+            if idx and s and a:
+                items.append((int(idx), int(s), int(a)))
+        items.sort()
+        return [(s, a) for _, s, a in items]
+
+    return collect("page"), collect("juz")
+
+
 def validate(arabic: dict, translation: dict) -> None:
     errors = []
     if len(arabic) != 6236:
@@ -106,6 +130,28 @@ def validate(arabic: dict, translation: dict) -> None:
     print("Validasi OK: 114 surah, 6.236 ayat, tidak ada yang kosong.")
 
 
+def validate_pages(pages: list, juzs: list) -> None:
+    errors = []
+    if len(pages) != TOTAL_PAGES:
+        errors.append(f"Jumlah halaman {len(pages)}, seharusnya {TOTAL_PAGES}")
+    elif pages[0] != (1, 1):
+        errors.append(f"Halaman 1 harus mulai di 1:1, ditemukan {pages[0]}")
+    if juzs and len(juzs) != 30:
+        errors.append(f"Jumlah juz {len(juzs)}, seharusnya 30")
+    for s, a in pages + juzs:
+        if not (1 <= s <= 114 and 1 <= a <= AYAH_COUNTS[s - 1]):
+            errors.append(f"Titik awal tidak valid: {s}:{a}")
+    if not errors:
+        if pages != sorted(pages) or len(set(pages)) != len(pages):
+            errors.append("Urutan halaman tidak naik secara ketat")
+    if errors:
+        print("VALIDASI HALAMAN GAGAL:", file=sys.stderr)
+        for e in errors[:20]:
+            print(" -", e, file=sys.stderr)
+        sys.exit(1)
+    print(f"Validasi halaman OK: {len(pages)} halaman, {len(juzs)} juz.")
+
+
 def write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -118,7 +164,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--arabic", required=True, type=Path)
     p.add_argument("--translation", required=True, type=Path)
-    p.add_argument("--meta", type=Path, help="quran-data.xml dari Tanzil (opsional)")
+    p.add_argument("--meta", type=Path, help="quran-data.xml dari Tanzil (nama surah + halaman)")
     p.add_argument("--out", type=Path, default=Path("dist"))
     p.add_argument("--skip-ayat", action="store_true", help="jangan buat file per ayat")
     args = p.parse_args()
@@ -129,9 +175,25 @@ def main() -> None:
 
     meta = parse_meta(args.meta) if args.meta else {}
 
+    pages, juzs = ([], [])
+    if args.meta:
+        pages, juzs = parse_partitions(args.meta)
+        if pages:
+            validate_pages(pages, juzs)
+        else:
+            print("Peringatan: data halaman tidak ditemukan di file meta, halaman dilewati.")
+
+    page_pos = [POS[k] for k in pages]
+    juz_pos = [POS[k] for k in juzs]
+
+    def ayah_obj(s, a):
+        return {"surah": s, "number": a, "arabic": arabic[(s, a)], "translation": translation[(s, a)]}
+
     index = []
     for s, count in enumerate(AYAH_COUNTS, start=1):
         info = {"number": s, **meta.get(s, {}), "ayah_count": count}
+        if page_pos:
+            info["start_page"] = bisect.bisect_right(page_pos, POS[(s, 1)])
         index.append(info)
 
         ayat = [
@@ -147,18 +209,28 @@ def main() -> None:
                     {"surah": s, **item},
                 )
 
+    if pages:
+        for i in range(TOTAL_PAGES):
+            start = page_pos[i]
+            end = page_pos[i + 1] if i + 1 < TOTAL_PAGES else len(ALL_KEYS)
+            page_obj = {"page": i + 1}
+            if juz_pos:
+                page_obj["juz"] = bisect.bisect_right(juz_pos, start)
+            page_obj["ayat"] = [ayah_obj(s, a) for s, a in ALL_KEYS[start:end]]
+            write_json(args.out / "page" / f"{i + 1}.json", page_obj)
+
     write_json(args.out / "index.json", index)
-    write_json(
-        args.out / "meta.json",
-        {
-            "total_surah": 114,
-            "total_ayat": 6236,
-            "sources": {
-                "arabic": {"file": args.arabic.name, "sha256": sha256(args.arabic)},
-                "translation": {"file": args.translation.name, "sha256": sha256(args.translation)},
-            },
+    meta_obj = {
+        "total_surah": 114,
+        "total_ayat": 6236,
+        "sources": {
+            "arabic": {"file": args.arabic.name, "sha256": sha256(args.arabic)},
+            "translation": {"file": args.translation.name, "sha256": sha256(args.translation)},
         },
-    )
+    }
+    if pages:
+        meta_obj["total_pages"] = TOTAL_PAGES
+    write_json(args.out / "meta.json", meta_obj)
     print(f"Selesai. Output ada di: {args.out.resolve()}")
 
 
